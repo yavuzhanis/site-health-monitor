@@ -4,22 +4,22 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import os
 import smtplib
+import socket
+import ssl
 import sys
 import time
+from urllib.parse import urlparse
 import requests
 
 # Konfigürasyon
 TIMEOUT = int(os.getenv("TIMEOUT_SECONDS", "8"))
-MAX_WORKERS = 15  # 70 siteyi paralel taramak için eşzamanlı thread sayısı
+MAX_WORKERS = 15
+SSL_ALERT_DAYS = 15  # SSL bitişine 15 günden az kalırsa uyar
 
 # Gmail Bilgileri
-GMAIL_USER = os.getenv("GMAIL_USER")  # Gönderici Gmail adresiniz
-GMAIL_APP_PASSWORD = os.getenv(
-    "GMAIL_APP_PASSWORD"
-)  # 16 haneli Uygulama Şifresi
-RECEIVER_EMAILS_RAW = os.getenv(
-    "RECEIVER_EMAILS", ""
-)  # Virgülle ayrılmış 2 alıcı
+GMAIL_USER = os.getenv("GMAIL_USER")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+RECEIVER_EMAILS_RAW = os.getenv("RECEIVER_EMAILS", "")
 RECEIVERS = [
     email.strip() for email in RECEIVER_EMAILS_RAW.split(",") if email.strip()
 ]
@@ -36,19 +36,40 @@ def load_sites():
     return []
 
 
-def check_single_site(url: str):
-    """Tek bir siteyi denetler ve sonucu döndürür."""
+def get_ssl_days_left(hostname: str, port: int = 443):
+    """SSL sertifikasının bitişine kaç gün kaldığını hesaplar."""
+    context = ssl.create_default_context()
+    conn = context.wrap_socket(socket.socket(), server_hostname=hostname)
+    conn.settimeout(5.0)
+    try:
+        conn.connect((hostname, port))
+        cert = conn.getpeercert()
+        conn.close()
+
+        # 'notAfter' formatı: May 15 12:00:00 2026 GMT
+        expire_date = datetime.strptime(
+            cert["notAfter"], "%b %d %H:%M:%S %Y %Z"
+        ).replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        days_left = (expire_date - now).days
+        return days_left
+    except Exception:
+        return None
+
+
+def execute_request(url: str):
+    """Tekil HTTP isteği yapar."""
     start = time.time()
     try:
         response = requests.get(
             url,
             timeout=TIMEOUT,
-            headers={"User-Agent": "SiteHealthMonitor/2.0 (Automated Check)"},
+            headers={"User-Agent": "SiteHealthMonitor/3.0 (Advanced Probes)"},
         )
         elapsed = round(time.time() - start, 2)
-
         if response.status_code >= 400:
             return {
+                "ok": False,
                 "url": url,
                 "status": "HTTP_ERROR",
                 "code": response.status_code,
@@ -56,14 +77,15 @@ def check_single_site(url: str):
                 "time": elapsed,
             }
         return {
+            "ok": True,
             "url": url,
             "status": "OK",
             "code": response.status_code,
             "time": elapsed,
         }
-
     except requests.exceptions.Timeout:
         return {
+            "ok": False,
             "url": url,
             "status": "TIMEOUT",
             "code": "-",
@@ -72,6 +94,7 @@ def check_single_site(url: str):
         }
     except requests.exceptions.ConnectionError:
         return {
+            "ok": False,
             "url": url,
             "status": "CONNECTION_ERROR",
             "code": "-",
@@ -80,6 +103,7 @@ def check_single_site(url: str):
         }
     except Exception as e:
         return {
+            "ok": False,
             "url": url,
             "status": "EXCEPTION",
             "code": "-",
@@ -88,54 +112,135 @@ def check_single_site(url: str):
         }
 
 
-def send_email_alert(failures: list, total_checked: int):
+def check_single_site(url: str):
+    """Siteyi dener; hata verirse 3 saniye sonra 2. kez dener (Yalancı alarm önleme)."""
+    res = execute_request(url)
+
+    # 1. Denemede hata çıkarsa 3 sn bekleyip çift kontrol (Retry) yap
+    if not res["ok"]:
+        time.sleep(3)
+        retry_res = execute_request(url)
+        if retry_res["ok"]:
+            return {
+                "health": retry_res,
+                "ssl_warning": None,
+                "note": "Geçici dalgalanma (2. denemede kurtardı)",
+            }
+        res = retry_res
+
+    # Site HTTPS ise SSL süresini denetle
+    ssl_warning = None
+    if url.startswith("https://"):
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.hostname
+            port = parsed.port or 443
+            days = get_ssl_days_left(hostname, port)
+            if days is not None and days <= SSL_ALERT_DAYS:
+                ssl_warning = {
+                    "url": url,
+                    "domain": hostname,
+                    "days_left": days,
+                }
+        except Exception:
+            pass
+
+    return {"health": res, "ssl_warning": ssl_warning}
+
+
+def send_email_alert(failures: list, ssl_warnings: list, total_checked: int):
     if not GMAIL_USER or not GMAIL_APP_PASSWORD or not RECEIVERS:
-        print("HATA: Gmail kimlik bilgileri veya alıcı adresler eksik!")
+        print("HATA: Gmail kimlik bilgileri eksik!")
         return
 
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_utc = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M:%S UTC")
 
-    # HTML Tablo Satırları
-    rows_html = ""
-    for item in failures:
-        rows_html += f"""
-        <tr style="border-bottom: 1px solid #e0e0e0;">
-            <td style="padding: 10px; font-weight: bold; color: #1a73e8;"><a href="{item['url']}">{item['url']}</a></td>
-            <td style="padding: 10px; color: #d93025; font-weight: bold;">{item['code']}</td>
-            <td style="padding: 10px; color: #5f6368;">{item['detail']}</td>
-            <td style="padding: 10px; color: #5f6368;">{item['time']}</td>
-        </tr>
+    # Çöken Siteler Tablosu
+    error_section = ""
+    if failures:
+        rows_error = "".join(
+            [
+                f"""
+            <tr style="border-bottom: 1px solid #fee2e2;">
+                <td style="padding: 10px; font-weight: bold;"><a href="{item['url']}" style="color: #2563eb; text-decoration: none;">{item['url']}</a></td>
+                <td style="padding: 10px; color: #dc2626; font-weight: bold;">{item['code']}</td>
+                <td style="padding: 10px; color: #4b5563;">{item['detail']}</td>
+                <td style="padding: 10px; color: #6b7280;">{item['time']}s</td>
+            </tr>
+        """
+                for item in failures
+            ]
+        )
+
+        error_section = f"""
+        <h3 style="color: #dc2626; margin-top: 25px; margin-bottom: 10px;">🔴 Kesinti Yaşayan Siteler ({len(failures)})</h3>
+        <table style="width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; border-radius: 6px; overflow: hidden; border: 1px solid #fca5a5;">
+            <thead>
+                <tr style="background-color: #fee2e2; color: #991b1b; text-align: left;">
+                    <th style="padding: 10px;">URL</th>
+                    <th style="padding: 10px;">Durum Kodu</th>
+                    <th style="padding: 10px;">Hata Sebebi</th>
+                    <th style="padding: 10px;">Süre</th>
+                </tr>
+            </thead>
+            <tbody>{rows_error}</tbody>
+        </table>
         """
 
-    html_content = f"""
+    # Süresi Yaklaşan SSL Sertifikaları Tablosu
+    ssl_section = ""
+    if ssl_warnings:
+        rows_ssl = "".join(
+            [
+                f"""
+            <tr style="border-bottom: 1px solid #fef3c7;">
+                <td style="padding: 10px; font-weight: bold;"><a href="{item['url']}" style="color: #2563eb; text-decoration: none;">{item['domain']}</a></td>
+                <td style="padding: 10px; color: #d97706; font-weight: bold;">{item['days_left']} gün kaldı</td>
+                <td style="padding: 10px; color: #4b5563;">Sertifika yenilenmeli</td>
+            </tr>
+        """
+                for item in ssl_warnings
+            ]
+        )
+
+        ssl_section = f"""
+        <h3 style="color: #d97706; margin-top: 25px; margin-bottom: 10px;">🔒 Süresi Yaklaşan SSL Sertifikaları ({len(ssl_warnings)})</h3>
+        <table style="width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; border-radius: 6px; overflow: hidden; border: 1px solid #fde68a;">
+            <thead>
+                <tr style="background-color: #fef3c7; color: #92400e; text-align: left;">
+                    <th style="padding: 10px;">Domain</th>
+                    <th style="padding: 10px;">Kalan Süre</th>
+                    <th style="padding: 10px;">İşlem</th>
+                </tr>
+            </thead>
+            <tbody>{rows_ssl}</tbody>
+        </table>
+        """
+
+    subject = f"🚨 İzleme Raporu: "
+    if failures and ssl_warnings:
+        subject += f"{len(failures)} Kesinti, {len(ssl_warnings)} SSL Uyarısı"
+    elif failures:
+        subject += f"{len(failures)} Sitede Kesinti Mevcut"
+    else:
+        subject += f"{len(ssl_warnings)} Domainde SSL Bitişi Yaklaştı"
+
+    html_body = f"""
     <!DOCTYPE html>
     <html>
-    <body style="font-family: Arial, sans-serif; background-color: #f9f9f9; padding: 20px; color: #333;">
-        <div style="max-width: 650px; margin: 0 auto; background: #ffffff; padding: 24px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-            <h2 style="color: #d93025; margin-top: 0;">🚨 Site Kesintisi Uyarısı</h2>
-            <p style="font-size: 14px; color: #555;">
-                Yapılan saatlik denetimde toplam <strong>{total_checked}</strong> siteden 
-                <span style="color: #d93025; font-weight: bold;">{len(failures)}</span> tanesinde hata tespit edildi.
-            </p>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #f3f4f6; padding: 20px; color: #1f2937;">
+        <div style="max-width: 680px; margin: 0 auto; background: #ffffff; padding: 24px; border-radius: 8px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
+            <div style="border-bottom: 2px solid #e5e7eb; padding-bottom: 12px;">
+                <h2 style="margin: 0; color: #111827;">Web Sağlık ve Güvenlik Raporu</h2>
+                <p style="margin: 5px 0 0 0; font-size: 13px; color: #6b7280;">Taranan Toplam Adres: <strong>{total_checked}</strong> | Zaman: <strong>{now_utc}</strong></p>
+            </div>
             
-            <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; margin: 20px 0;">
-                <thead>
-                    <tr style="background-color: #f1f3f4;">
-                        <th style="padding: 10px;">URL</th>
-                        <th style="padding: 10px;">Kod</th>
-                        <th style="padding: 10px;">Hata Nedeni</th>
-                        <th style="padding: 10px;">Süre (s)</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {rows_html}
-                </tbody>
-            </table>
+            {error_section}
+            {ssl_section}
             
-            <p style="font-size: 12px; color: #888; margin-bottom: 0;">
-                Kontrol Zamanı: {now_utc}<br>
-                Bu bildirim GitHub Actions otomatik denetleme servisi tarafından iletilmiştir.
-            </p>
+            <div style="margin-top: 30px; padding-top: 12px; border-top: 1px solid #e5e7eb; font-size: 11px; color: #9ca3af; text-align: center;">
+                Bu rapor GitHub Actions üzerinde çalışan otomatik Uptime botu tarafından oluşturulmuştur.
+            </div>
         </div>
     </body>
     </html>
@@ -144,10 +249,8 @@ def send_email_alert(failures: list, total_checked: int):
     msg = MIMEMultipart("alternative")
     msg["From"] = f"Site Monitor <{GMAIL_USER}>"
     msg["To"] = ", ".join(RECEIVERS)
-    msg["Subject"] = (
-        f"🚨 [ACİL] {len(failures)} Sitede Hata Tespit Edildi ({now_utc})"
-    )
-    msg.attach(MIMEText(html_content, "html"))
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html"))
 
     try:
         server = smtplib.SMTP("smtp.gmail.com", 587)
@@ -155,38 +258,48 @@ def send_email_alert(failures: list, total_checked: int):
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_USER, RECEIVERS, msg.as_string())
         server.quit()
-        print(f"E-posta başarıyla {len(RECEIVERS)} alıcıya gönderildi.")
+        print(f"E-posta başarıyla {len(RECEIVERS)} alıcıya iletildi.")
     except Exception as e:
-        print(f"E-posta gönderiminde kritik hata: {e}")
+        print(f"E-posta gönderiminde hata: {e}")
 
 
 def main():
     sites = load_sites()
     if not sites:
-        print("HATA: 'sites.txt' dosyası bulunamadı veya boş.")
+        print("HATA: 'sites.txt' boş veya okunamadı.")
         sys.exit(1)
 
-    print(f"Toplam {len(sites)} site paralel olarak taranıyor...")
+    print(f"Toplam {len(sites)} site kontrol ediliyor (Eşzamanlı)...")
 
-    failures = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         results = list(executor.map(check_single_site, sites))
 
-    for res in results:
-        if res["status"] != "OK":
-            failures.append(res)
-            print(f"❌ {res['url']} -> {res['status']} ({res['detail']})")
-        else:
-            print(f"✅ {res['url']} -> {res['code']} ({res['time']}s)")
+    failures = []
+    ssl_warnings = []
 
-    if failures:
+    for r in results:
+        h = r["health"]
+        if not h["ok"]:
+            failures.append(h)
+            print(f"❌ {h['url']} -> {h['status']} ({h['detail']})")
+        else:
+            print(f"✅ {h['url']} -> {h['code']} ({h['time']}s)")
+
+        if r.get("ssl_warning"):
+            ssl_warnings.append(r["ssl_warning"])
+            print(
+                f"🔒 SSL Uyarısı: {r['ssl_warning']['domain']} ({r['ssl_warning']['days_left']} gün kaldı)"
+            )
+
+    if failures or ssl_warnings:
         print(
-            f"\n{len(failures)} sitede problem var. E-posta hazırlanıyor..."
+            f"\nUyarılar mevcut (Hata: {len(failures)}, SSL: {len(ssl_warnings)}). E-posta gönderiliyor..."
         )
-        send_email_alert(failures, len(sites))
+        send_email_alert(failures, ssl_warnings, len(sites))
+        # Alarm durumunu GitHub arayüzünde görünür kılmak için
         sys.exit(1)
     else:
-        print("\nTüm siteler aktif (HTTP 200).")
+        print("\nTüm siteler sorunsuz çalışıyor ve SSL sertifikaları güncel.")
 
 
 if __name__ == "__main__":
