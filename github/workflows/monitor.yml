@@ -1,0 +1,32 @@
+name: Hourly 70-Sites Health Monitor
+
+on:
+  schedule:
+    # Her saatin başında (UTC) otomatik çalışır
+    - cron: '0 * * * *'
+  # GitHub arayüzünden tek tıkla elle test etmeyi sağlar
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repoyu Klonla
+        uses: actions/checkout@v4
+
+      - name: Python Ortamını Kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Bağımlılıkları Yükle
+        run: pip install -r requirements.txt
+
+      - name: Siteleri Denetle ve Mail Gönder
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECEIVER_EMAILS: ${{ secrets.RECEIVER_EMAILS }}
+          TIMEOUT_SECONDS: '8'
+        run: python monitor.py
