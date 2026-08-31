@@ -100,7 +100,7 @@ https://test.kapadokya.edu.tr
 https://test2.kapadokya.edu.tr
 https://turistrehberi.kapadokya.edu.tr
 https://turizm.kapadokya.edu.tr
-https://uzaktanogretim.kapadokya.edu.tr
+https://uzaktanogretim.kapadokya.edu.tr/almsp
 https://aday.kapadokya.edu.tr
 https://adayform.kapadokya.edu.tr
 https://ai.kapadokya.edu.tr
