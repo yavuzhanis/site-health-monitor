@@ -62,31 +62,19 @@ def save_state(state):
 
 def diagnose_error(status_type, code, detail):
     if status_type == "CONNECTION_ERROR":
-        return (
-            "DNS / Bağlantı Hatası",
-            "Domain A/CNAME kaydı eksik veya sunucu kapalı.",
-        )
+        return "DNS / Bağlantı Hatası", "Alan adı kaydı eksik veya sunucu kapalı."
     elif status_type == "TIMEOUT":
-        return (
-            "Zaman Aşımı",
-            f"Sunucu {TIMEOUT}s içinde yanıt vermedi. Aşırı yüklenme olabilir.",
-        )
+        return "Zaman Aşımı", f"Sunucu {TIMEOUT}s içinde yanıt vermedi."
     elif status_type == "BODY_ERROR":
-        return "Backend / Veritabanı Hatası", f"Sayfa içinde hata tespit edildi: {detail}"
+        return "Backend / DB Hatası", f"Sayfa içi hata: {detail}"
     elif code == 403:
-        return (
-            "403 Forbidden",
-            "WAF / Bot koruması isteği engelledi veya yetki kısıtlaması var.",
-        )
+        return "403 Forbidden", "WAF engeli veya dizin yetki kısıtı."
     elif code == 404:
-        return "404 Not Found", "Hedef sayfa veya route bulunamadı."
+        return "404 Not Found", "Sayfa bulunamadı."
     elif code == 500:
-        return "500 Sunucu Hatası", "Backend tarafında yakalanmamış kritik hata."
+        return "500 Sunucu Hatası", "Uygulama tarafında kritik hata."
     elif code in [502, 503]:
-        return (
-            f"{code} Servis Dışı",
-            "PHP-FPM veya upstream sunucu yanıt vermiyor.",
-        )
+        return f"{code} Servis Dışı", "PHP-FPM/Web sunucusu yanıt vermiyor."
     return f"HTTP {code}", detail
 
 
@@ -101,7 +89,6 @@ def execute_request(url: str):
             },
         )
         elapsed = round(time.time() - start, 2)
-
         if response.status_code >= 400:
             return {
                 "ok": False,
@@ -112,7 +99,6 @@ def execute_request(url: str):
                 "time": elapsed,
             }
 
-        # İçerik Hata Taraması
         body_sample = response.text[:20000].lower()
         for kw in DANGER_KEYWORDS:
             if kw in body_sample:
@@ -132,7 +118,6 @@ def execute_request(url: str):
             "code": response.status_code,
             "time": elapsed,
         }
-
     except requests.exceptions.Timeout:
         return {
             "ok": False,
@@ -173,18 +158,16 @@ def check_single_site(url: str):
     return res
 
 
-def send_email_alert(subject, html_content):
+def send_mail(subject: str, html_body: str):
     if not GMAIL_USER or not GMAIL_APP_PASSWORD or not RECEIVERS:
-        print(
-            "Bilgi: E-posta secrets tanımlanmamış, mail gönderimi atlanıyor."
-        )
+        print("Uyarı: Mail kimlik bilgileri tanımlı değil.")
         return
 
     msg = MIMEMultipart("alternative")
     msg["From"] = f"Uptime Monitör <{GMAIL_USER}>"
     msg["To"] = ", ".join(RECEIVERS)
     msg["Subject"] = subject
-    msg.attach(MIMEText(html_content, "html"))
+    msg.attach(MIMEText(html_body, "html"))
 
     try:
         server = smtplib.SMTP("smtp.gmail.com", 587)
@@ -194,108 +177,96 @@ def send_email_alert(subject, html_content):
         server.quit()
         print(f"E-posta başarıyla iletildi -> {', '.join(RECEIVERS)}")
     except Exception as e:
-        print(f"E-posta hatası: {e}")
+        print(f"E-posta gönderim hatası: {e}")
 
 
-def generate_dashboard(results, now_tr, uptime_rate):
-    """GitHub Pages için statik dashboard oluşturur."""
-    os.makedirs("public", exist_ok=True)
-
-    rows = ""
-    for r in sorted(results, key=lambda x: x["ok"]):
-        badge = (
-            '<span class="badge up">AKTİF</span>'
-            if r["ok"]
-            else '<span class="badge down">KESİNTİ</span>'
-        )
-        code_view = (
-            f"<code>HTTP {r['code']}</code>"
-            if r["code"] != "-"
-            else f"<code>{r['status']}</code>"
-        )
-        time_view = f"{r['time']}s" if r["time"] != "-" else "-"
-        detail_view = r.get("detail", "-") if not r["ok"] else "Sorunsuz"
-
-        rows += f"""
-        <tr>
-            <td><strong><a href="{r['url']}" target="_blank">{r['url']}</a></strong></td>
-            <td>{badge}</td>
-            <td>{code_view}</td>
-            <td>{time_view}</td>
-            <td class="text-muted">{detail_view}</td>
-        </tr>
+def build_daily_report_email(
+    results, failures, now_tr, uptime_rate, total_checked
+):
+    failure_rows = ""
+    if failures:
+        for item in failures:
+            title, desc = diagnose_error(
+                item["status"], item["code"], item["detail"]
+            )
+            code_badge = (
+                f'<span style="background:#fee2e2; color:#b91c1c; padding:3px 8px; border-radius:4px; font-weight:bold; font-size:12px;">{item["code"]}</span>'
+                if item["code"] != "-"
+                else '<span style="background:#f3f4f6; color:#4b5563; padding:3px 8px; border-radius:4px; font-size:12px;">-</span>'
+            )
+            failure_rows += f"""
+            <tr style="border-bottom: 1px solid #edf2f7;">
+                <td style="padding: 10px; font-weight:600;"><a href="{item['url']}" style="color:#2563eb; text-decoration:none;">{item['url']}</a></td>
+                <td style="padding: 10px;">{code_badge}</td>
+                <td style="padding: 10px; font-size:12px; color:#475569;"><strong>{title}</strong><br>{desc}</td>
+            </tr>
+            """
+        failure_section = f"""
+        <h3 style="color:#dc2626; margin: 20px 0 10px 0; font-size:15px;">🔴 Kesinti Yaşayan Siteler ({len(failures)})</h3>
+        <table style="width:100%; border-collapse:collapse; font-size:13px; text-align:left; border:1px solid #fee2e2;">
+            <tr style="background:#fee2e2; color:#991b1b;"><th style="padding:8px 10px;">URL</th><th style="padding:8px 10px;">Kod</th><th style="padding:8px 10px;">Teşhis</th></tr>
+            {failure_rows}
+        </table>
+        """
+    else:
+        failure_section = """
+        <div style="background:#f0fdf4; border:1px solid #bbf7d0; color:#166534; padding:16px; border-radius:8px; text-align:center; margin: 20px 0; font-weight:600;">
+            🎉 Harika! Tüm siteler eksiksiz ve sorunsuz çalışıyor (%100 Sağlık).
+        </div>
         """
 
-    html = f"""<!DOCTYPE html>
-<html lang="tr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sistem Durum Paneli</title>
-    <style>
-        :root {{ --primary: #0f172a; --bg: #f8fafc; --card: #ffffff; --border: #e2e8f0; --success: #16a34a; --danger: #dc2626; }}
-        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); margin: 0; padding: 24px 16px; color: #1e293b; }}
-        .container {{ max-width: 1000px; margin: 0 auto; }}
-        .header {{ background: var(--primary); color: white; padding: 28px; border-radius: 12px; margin-bottom: 24px; }}
-        .header h1 {{ margin: 0; font-size: 24px; }}
-        .header p {{ margin: 8px 0 0 0; color: #94a3b8; font-size: 14px; }}
-        .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }}
-        .card {{ background: var(--card); padding: 20px; border-radius: 12px; border: 1px solid var(--border); text-align: center; }}
-        .card .title {{ font-size: 12px; font-weight: bold; color: #64748b; text-transform: uppercase; }}
-        .card .value {{ font-size: 26px; font-weight: bold; margin-top: 6px; color: var(--primary); }}
-        .table-card {{ background: var(--card); border-radius: 12px; border: 1px solid var(--border); overflow: hidden; }}
-        table {{ width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }}
-        th {{ background: #f1f5f9; padding: 14px 16px; font-weight: 600; color: #475569; border-bottom: 1px solid var(--border); }}
-        td {{ padding: 14px 16px; border-bottom: 1px solid var(--border); }}
-        tr:last-child td {{ border-bottom: none; }}
-        a {{ color: #2563eb; text-decoration: none; }}
-        a:hover {{ text-decoration: underline; }}
-        .badge {{ padding: 4px 10px; border-radius: 99px; font-size: 11px; font-weight: bold; }}
-        .badge.up {{ background: #dcfce7; color: #166534; }}
-        .badge.down {{ background: #fee2e2; color: #991b1b; }}
-        .text-muted {{ color: #64748b; font-size: 13px; }}
-        code {{ background: #f1f5f9; padding: 3px 6px; border-radius: 4px; font-size: 12px; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🌐 Canlı Web Sağlık Durumu</h1>
-            <p>Son Güncelleme: {now_tr}</p>
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #f8fafc; padding: 24px 12px; margin: 0;">
+        <div style="max-width: 680px; margin: 0 auto; background: #ffffff; border-radius: 12px; overflow: hidden; border: 1px solid #e2e8f0;">
+            <div style="background: #0f172a; padding: 20px 24px; color: #ffffff;">
+                <h2 style="margin: 0; font-size: 18px;">📊 24 Saatlik Genel Sağlık Bülteni</h2>
+                <p style="margin: 4px 0 0 0; color: #94a3b8; font-size: 12px;">Kontrol Zamanı: {now_tr}</p>
+            </div>
+            <div style="padding: 20px 24px;">
+                <table style="width: 100%; border-spacing: 8px; border-collapse: separate; margin: -8px;">
+                    <tr>
+                        <td style="background:#f8fafc; border:1px solid #e2e8f0; padding:12px; border-radius:8px; text-align:center; width:25%;">
+                            <div style="font-size:11px; color:#64748b; font-weight:bold;">TARANAN</div>
+                            <div style="font-size:18px; font-weight:bold; color:#0f172a;">{total_checked}</div>
+                        </td>
+                        <td style="background:#f0fdf4; border:1px solid #bbf7d0; padding:12px; border-radius:8px; text-align:center; width:25%;">
+                            <div style="font-size:11px; color:#166534; font-weight:bold;">AKTİF</div>
+                            <div style="font-size:18px; font-weight:bold; color:#15803d;">{total_checked - len(failures)}</div>
+                        </td>
+                        <td style="background:#fef2f2; border:1px solid #fecaca; padding:12px; border-radius:8px; text-align:center; width:25%;">
+                            <div style="font-size:11px; color:#991b1b; font-weight:bold;">HATALI</div>
+                            <div style="font-size:18px; font-weight:bold; color:#dc2626;">{len(failures)}</div>
+                        </td>
+                        <td style="background:#f8fafc; border:1px solid #e2e8f0; padding:12px; border-radius:8px; text-align:center; width:25%;">
+                            <div style="font-size:11px; color:#64748b; font-weight:bold;">UPTIME</div>
+                            <div style="font-size:18px; font-weight:bold; color:#2563eb;">%{uptime_rate}</div>
+                        </td>
+                    </tr>
+                </table>
+                {failure_section}
+            </div>
+            <div style="background:#f8fafc; padding:14px; text-align:center; font-size:11px; color:#64748b; border-top:1px solid #e2e8f0;">
+                Bu bülten sistemin aktif olarak çalıştığını teyit etmek amacıyla günlük 24 saatte bir otomatik gönderilmektedir.
+            </div>
         </div>
-        <div class="grid">
-            <div class="card"><div class="title">Toplam Adres</div><div class="value">{len(results)}</div></div>
-            <div class="card"><div class="title">Aktif Siteler</div><div class="value" style="color:var(--success)">{len([r for r in results if r['ok']])}</div></div>
-            <div class="card"><div class="title">Hatalı Siteler</div><div class="value" style="color:var(--danger)">{len([r for r in results if not r['ok']])}</div></div>
-            <div class="card"><div class="title">Erişilebilirlik</div><div class="value">%{uptime_rate}</div></div>
-        </div>
-        <div class="table-card">
-            <table>
-                <thead>
-                    <tr><th>Adres</th><th>Durum</th><th>HTTP / Yanıt</th><th>Süre</th><th>Detay</th></tr>
-                </thead>
-                <tbody>
-                    {rows}
-                </tbody>
-            </table>
-        </div>
-    </div>
-</body>
-</html>"""
-    with open("public/index.html", "w", encoding="utf-8") as f:
-        f.write(html)
+    </body>
+    </html>
+    """
 
 
 def main():
     sites = load_sites()
     if not sites:
-        print("HATA: 'sites.txt' boş veya bulunamadı.")
+        print("HATA: 'sites.txt' boş.")
         sys.exit(1)
 
+    is_daily_report = os.getenv("DAILY_REPORT", "false").lower() == "true"
     previous_state = load_state()
     current_state = {}
 
-    print(f"Toplam {len(sites)} adres denetleniyor...")
+    print(f"Toplam {len(sites)} site taranıyor...")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         results = list(executor.map(check_single_site, sites))
 
@@ -310,88 +281,48 @@ def main():
         url = r["url"]
         is_ok = r["ok"]
         current_state[url] = is_ok
-
         was_ok = previous_state.get(url, True)
 
         if not is_ok:
             current_failures.append(r)
-            if was_ok:  # Daha önce çalışıyordu, şimdi çöktü
+            if was_ok:
                 new_failures.append(r)
         else:
-            if not was_ok:  # Daha önce çökmüştü, şimdi düzeldi
+            if not was_ok:
                 recovered_sites.append(r)
 
     save_state(current_state)
-
     uptime_rate = round(
         ((len(sites) - len(current_failures)) / len(sites)) * 100, 1
     )
 
-    # 1. GitHub Pages Paneli Oluştur
-    generate_dashboard(results, now_tr, uptime_rate)
+    # 1. Günlük 24 Saatlik Otomatik Rapor Modu
+    if is_daily_report:
+        print("24 saatlik periyodik günlük bülten gönderiliyor...")
+        subject = f"📊 Günlük Sağlık Bülteni: %{uptime_rate} Uptime ({len(current_failures)} Kesinti)"
+        html = build_daily_report_email(
+            results, current_failures, now_tr, uptime_rate, len(sites)
+        )
+        send_mail(subject, html)
+        return
 
-    # 2. Akıllı Bildirim Yönetimi
+    # 2. Anlık Alarm Modu (Durum Değişikliği)
     if new_failures:
-        table_rows = "".join(
-            [
-                f"""
-            <tr style="border-bottom:1px solid #fee2e2;">
-                <td style="padding:10px;"><a href="{item['url']}">{item['url']}</a></td>
-                <td style="padding:10px; color:#dc2626; font-weight:bold;">{item['code']}</td>
-                <td style="padding:10px;">{diagnose_error(item['status'], item['code'], item['detail'])[0]}</td>
-            </tr>
-        """
-                for item in new_failures
-            ]
+        print(f"Yeni kesinti tespit edildi ({len(new_failures)} site).")
+        subject = f"🚨 [ACİL ALARM] {len(new_failures)} Site Az Önce Çöktü!"
+        html = build_daily_report_email(
+            results, new_failures, now_tr, uptime_rate, len(sites)
         )
-
-        email_html = f"""
-        <div style="font-family:sans-serif; max-width:650px; margin:auto; background:#fff; padding:24px; border:1px solid #fee2e2; border-radius:10px;">
-            <h2 style="color:#dc2626; margin-top:0;">🚨 Yeni Kesinti Algılandı</h2>
-            <p>Aşağıdaki <strong>{len(new_failures)}</strong> site az önce yanıt vermeyi kesti:</p>
-            <table style="width:100%; border-collapse:collapse; font-size:13px; text-align:left;">
-                <tr style="background:#fee2e2; color:#991b1b;"><th style="padding:8px;">URL</th><th style="padding:8px;">Kod</th><th style="padding:8px;">Teşhis</th></tr>
-                {table_rows}
-            </table>
-            <p style="font-size:12px; color:#6b7280; margin-top:20px;">Tarih: {now_tr}</p>
-        </div>
-        """
-        send_email_alert(
-            f"🚨 [DİKKAT] {len(new_failures)} Site Az Önce Çöktü!", email_html
-        )
-
+        send_mail(subject, html)
     elif recovered_sites:
-        table_rows = "".join(
-            [
-                f"""
-            <tr style="border-bottom:1px solid #dcfce7;">
-                <td style="padding:10px;"><a href="{item['url']}">{item['url']}</a></td>
-                <td style="padding:10px; color:#16a34a; font-weight:bold;">HTTP 200</td>
-                <td style="padding:10px; color:#166534;">Yeniden Aktif ({item['time']}s)</td>
-            </tr>
-        """
-                for item in recovered_sites
-            ]
+        print(f"Siteler düzeldi ({len(recovered_sites)} site).")
+        subject = f"🟢 [ÇÖZÜLDÜ] {len(recovered_sites)} Site Tekrar Yayında"
+        html = build_daily_report_email(
+            results, [], now_tr, uptime_rate, len(sites)
         )
-
-        email_html = f"""
-        <div style="font-family:sans-serif; max-width:650px; margin:auto; background:#fff; padding:24px; border:1px solid #bbf7d0; border-radius:10px;">
-            <h2 style="color:#16a34a; margin-top:0;">🟢 Siteler Yeniden Erişilebilir</h2>
-            <p>Daha önce çöken <strong>{len(recovered_sites)}</strong> site yeniden ayağa kalktı:</p>
-            <table style="width:100%; border-collapse:collapse; font-size:13px; text-align:left;">
-                <tr style="background:#dcfce7; color:#166534;"><th style="padding:8px;">URL</th><th style="padding:8px;">Durum</th><th style="padding:8px;">Yanıt Süresi</th></tr>
-                {table_rows}
-            </table>
-            <p style="font-size:12px; color:#6b7280; margin-top:20px;">Tarih: {now_tr}</p>
-        </div>
-        """
-        send_email_alert(
-            f"🟢 [ÇÖZÜLDÜ] {len(recovered_sites)} Site Tekrar Yayında",
-            email_html,
-        )
-
+        send_mail(subject, html)
     else:
-        print("Durum değişikliği yok (Yeni çökme veya düzelme gerçekleşmedi).")
+        print("Durum değişikliği yok.")
 
 
 if __name__ == "__main__":
