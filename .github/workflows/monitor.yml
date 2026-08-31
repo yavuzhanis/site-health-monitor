@@ -2,13 +2,19 @@ name: Universal Multi-Site Health Monitor
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    # 1. Saatlik Anlık Çökme Kontrolü (Her saatin 17. dakikası)
+    - cron: '17 * * * *'
+    # 2. Günlük 24 Saatlik Rapor (Her sabah Türkiye saatiyle 09:17 -> UTC 06:17)
+    - cron: '17 6 * * *'
   workflow_dispatch:
+    inputs:
+      force_daily_report:
+        description: 'Günlük bülteni şimdi gönder'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 jobs:
   monitor:
@@ -26,31 +32,20 @@ jobs:
       - name: Paketleri Yükle
         run: pip install -r requirements.txt
 
-      - name: Siteleri Denetle & Panel Üret
+      - name: Siteleri Denetle ve Mail Gönder
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECEIVER_EMAILS: ${{ secrets.RECEIVER_EMAILS }}
           TIMEOUT_SECONDS: '8'
+          # Sabah 06:17 UTC çalışmasında veya manuel tetiklemede DAILY_REPORT=true olur
+          DAILY_REPORT: ${{ github.event.schedule == '17 6 * * *' || inputs.force_daily_report == true }}
         run: python monitor.py
 
-      - name: Durumu Kaydet (State JSON Commit)
+      - name: Durumu Kaydet (State JSON)
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add state.json || true
           git commit -m "chore: update monitor state [skip ci]" || echo "Değişiklik yok"
           git push origin main || true
-
-      - name: Statü Sayfasını GitHub Pages'e Yükle
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: 'public'
-
-  deploy-pages:
-    needs: monitor
-    runs-on: ubuntu-latest
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
