@@ -31,7 +31,7 @@
   "https://eys.kapadokya.edu.tr": true,
   "https://form.kapadokya.edu.tr": true,
   "https://ftp.kapadokya.edu.tr": false,
-  "https://gastromer.kapadokya.edu.tr": false,
+  "https://gastromer.kapadokya.edu.tr": true,
   "https://gastronomi.kapadokya.edu.tr": true,
   "https://hakikat.kapadokya.edu.tr": false,
   "https://havacilik.kapadokya.edu.tr": true,
