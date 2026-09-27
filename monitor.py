@@ -93,7 +93,11 @@ def create_session():
         status_forcelist=[502, 503, 504],
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retries, pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
+    adapter = HTTPAdapter(
+        max_retries=retries,
+        pool_connections=MAX_WORKERS,
+        pool_maxsize=MAX_WORKERS,
+    )
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -112,14 +116,12 @@ def get_ssl_expiry_days(hostname: str, port: int = 443):
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert = ssock.getpeercert(binary_form=False)
                 if not cert:
-                    # binary formatta alıp derle
-                    der_cert = ssock.getpeercert(binary_form=True)
-                    x509 = ssl.DER_cert_to_PEM_cert(der_cert)
-                    # Basit parse alternatifi
                     return None
                 expire_date_str = cert.get("notAfter")
                 if expire_date_str:
-                    expire_date = datetime.strptime(expire_date_str, "%b %d %H:%M:%S %Y %Z")
+                    expire_date = datetime.strptime(
+                        expire_date_str, "%b %d %H:%M:%S %Y %Z"
+                    )
                     remaining = (expire_date - datetime.utcnow()).days
                     return remaining
     except Exception:
@@ -130,12 +132,49 @@ def get_ssl_expiry_days(hostname: str, port: int = 443):
 def execute_request(url: str):
     start = time.time()
     parsed = urlparse(url)
-    hostname = parsed.hostname or url
+    hostname = parsed.hostname
 
+    if not hostname:
+        return {
+            "ok": False,
+            "url": url,
+            "status": "INVALID_URL",
+            "code": "-",
+            "detail": "Geçersiz URL Formatı",
+            "time": "-",
+            "ssl_days": None,
+        }
+
+    # 1. Ön DNS Çözümleme Denetimi
+    try:
+        socket.gethostbyname(hostname)
+    except socket.gaierror:
+        return {
+            "ok": False,
+            "url": url,
+            "status": "DNS_NOT_FOUND",
+            "code": "-",
+            "detail": "Sunucu Bulunamıyor (DNS Kaydı Yok)",
+            "time": "-",
+            "ssl_days": None,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "url": url,
+            "status": "SOCKET_ERROR",
+            "code": "-",
+            "detail": f"Ağ Hatası: {str(e)[:25]}",
+            "time": "-",
+            "ssl_days": None,
+        }
+
+    # 2. SSL Kalan Gün Kontrolü
     ssl_days = None
     if url.startswith("https://"):
         ssl_days = get_ssl_expiry_days(hostname, parsed.port or 443)
 
+    # 3. HTTP İstek Denetimi
     try:
         response = SESSION.get(
             url,
@@ -145,6 +184,27 @@ def execute_request(url: str):
             verify=False,
         )
         elapsed = round(time.time() - start, 2)
+
+        # Yanlış wildcard veya hata yönlendirmesi denetimi
+        final_hostname = urlparse(response.url).hostname
+        if (
+            final_hostname
+            and final_hostname != hostname
+            and not hostname.endswith(final_hostname)
+        ):
+            if any(
+                term in response.url.lower()
+                for term in ["error", "search", "park", "bulunamadi"]
+            ):
+                return {
+                    "ok": False,
+                    "url": url,
+                    "status": "REDIRECT_LOOP",
+                    "code": response.status_code,
+                    "detail": "Hata / Park Sayfasına Yönlendirildi",
+                    "time": elapsed,
+                    "ssl_days": ssl_days,
+                }
 
         ssl_warning = ""
         if ssl_days is not None and ssl_days <= SSL_EXPIRY_THRESHOLD_DAYS:
@@ -185,7 +245,9 @@ def execute_request(url: str):
                     "ssl_days": ssl_days,
                 }
 
-        detail_text = f"Sorunsuz Yanıt{ssl_warning}" if ssl_warning else "Sorunsuz Yanıt"
+        detail_text = (
+            f"Sorunsuz Yanıt{ssl_warning}" if ssl_warning else "Sorunsuz Yanıt"
+        )
         return {
             "ok": True,
             "url": url,
@@ -269,6 +331,7 @@ def execute_request(url: str):
 
 def check_single_site(url: str):
     res = execute_request(url)
+    # Hata durumunda teyit için 2 sn bekleyip tekrar dene
     if not res["ok"]:
         time.sleep(2)
         retry_res = execute_request(url)
@@ -340,7 +403,7 @@ def render_dashboard_email(
     failures = [r for r in results if not r["ok"]]
     healthy = [r for r in results if r["ok"]]
 
-    # E-posta istemcileriyle uyumlu table-based failure kartları
+    # E-posta istemcileriyle uyumlu iç içe table mimarisi
     failure_cards = ""
     if failures:
         for f in failures:
@@ -376,7 +439,11 @@ def render_dashboard_email(
             if h["time"] != "-" and h["time"] < 1.0
             else ("#f59e0b" if h["time"] != "-" and h["time"] < 2.5 else "#64748b")
         )
-        ssl_text = f" <span style='color:#f59e0b;'>({h['ssl_days']}g SSL)</span>" if h.get("ssl_days") and h["ssl_days"] <= SSL_EXPIRY_THRESHOLD_DAYS else ""
+        ssl_text = (
+            f" <span style='color:#f59e0b;'>({h['ssl_days']}g SSL)</span>"
+            if h.get("ssl_days") and h["ssl_days"] <= SSL_EXPIRY_THRESHOLD_DAYS
+            else ""
+        )
         healthy_rows += f"""
         <tr style="border-bottom:1px solid #f1f5f9; font-size:12px;">
             <td style="padding:8px 0;"><a href="{h['url']}" style="color:#334155; text-decoration:none;">{h['url']}</a>{ssl_text}</td>
@@ -517,7 +584,7 @@ def main():
 
     # 2. Anlık Kesinti / Kurtarma Alarmları
     if new_failures:
-        print(f"Yeni kesinti: {len(new_failures)} site.")
+        print(f"Yeni kesinti tespit edildi: {len(new_failures)} site.")
         subject = f"🚨 [ALARM] {len(new_failures)} Adres Yanıt Vermiyor!"
         html = render_dashboard_email(
             "ACİL KESİNTİ ALARMI",
@@ -529,12 +596,11 @@ def main():
         )
         send_mail(subject, html)
 
-        # Telegram / Discord bildirim metni
         err_msg = "\n".join([f"- {f['url']} ({f['detail']})" for f in new_failures])
         send_webhook_alert(subject, f"Aşağıdaki adreslerde kesinti tespit edildi:\n{err_msg}")
 
     elif recovered_sites:
-        print(f"Düzelen siteler: {len(recovered_sites)} site.")
+        print(f"Düzelen siteler tespit edildi: {len(recovered_sites)} site.")
         subject = f"🟢 [DÜZELDİ] {len(recovered_sites)} Site Tekrar Erişilebilir"
         html = render_dashboard_email(
             "SİSTEMLER DÜZELDİ",
