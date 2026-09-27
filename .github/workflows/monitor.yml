@@ -23,8 +23,8 @@ jobs:
       - name: Repoyu Klonla
         uses: actions/checkout@v4
         with:
-          # Git commit & push sırasında geçmiş ve HEAD senkronizasyonu için
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Python Ortamını Kur
         uses: actions/setup-python@v5
@@ -48,7 +48,6 @@ jobs:
           TIMEOUT_SECONDS: '8'
           MAX_WORKERS: '10'
           SSL_EXPIRY_THRESHOLD_DAYS: '14'
-          # Sabah 06:17 UTC çalışmasında veya manuel tetiklemede DAILY_REPORT=true olur
           DAILY_REPORT: ${{ github.event.schedule == '17 6 * * *' || inputs.force_daily_report == true }}
         run: python monitor.py
 
@@ -61,7 +60,7 @@ jobs:
             git add state.json
             if ! git diff --staged --quiet; then
               git commit -m "chore: update monitor state [skip ci]"
-              git pull --rebase origin main
+              git pull --rebase origin main || true
               git push origin main
             else
               echo "Durum dosyasında değişiklik tespit edilmedi."
