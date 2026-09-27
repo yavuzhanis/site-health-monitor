@@ -15,12 +15,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import urllib3
 
-# SSL uyarılarını sustur (kendi sertifikası olan alt domainler için)
+# SSL uyarılarını sustur
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Ortam Değişkenleri & Konfigürasyon
 TIMEOUT = int(os.getenv("TIMEOUT_SECONDS", "10"))
-MAX_WORKERS = 10  # Güvenlik duvarına takılmamak için 10 iş parçacığına optimize edildi
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
 STATE_FILE = "state.json"
+SSL_EXPIRY_THRESHOLD_DAYS = int(os.getenv("SSL_EXPIRY_THRESHOLD_DAYS", "14"))
 
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
@@ -29,7 +31,10 @@ RECEIVERS = [
     email.strip() for email in RECEIVER_EMAILS_RAW.split(",") if email.strip()
 ]
 
-# Gerçek masaüstü Chrome tarayıcı başlıkları (WAF bypass için)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -55,9 +60,7 @@ def load_sites():
                 url = line.strip()
                 if not url or url.startswith("#"):
                     continue
-                if not url.startswith("http://") and not url.startswith(
-                    "https://"
-                ):
+                if not url.startswith("http://") and not url.startswith("https://"):
                     url = f"https://{url}"
                 sites.append(url)
         return sorted(list(set(sites)))
@@ -75,8 +78,11 @@ def load_state():
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Uyarı: Durum dosyası yazılamadı: {e}")
 
 
 def create_session():
@@ -87,7 +93,7 @@ def create_session():
         status_forcelist=[502, 503, 504],
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -96,27 +102,63 @@ def create_session():
 SESSION = create_session()
 
 
+def get_ssl_expiry_days(hostname: str, port: int = 443):
+    """Sertifikanın bitmesine kalan gün sayısını döner."""
+    try:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((hostname, port), timeout=4) as sock:
+            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert = ssock.getpeercert(binary_form=False)
+                if not cert:
+                    # binary formatta alıp derle
+                    der_cert = ssock.getpeercert(binary_form=True)
+                    x509 = ssl.DER_cert_to_PEM_cert(der_cert)
+                    # Basit parse alternatifi
+                    return None
+                expire_date_str = cert.get("notAfter")
+                if expire_date_str:
+                    expire_date = datetime.strptime(expire_date_str, "%b %d %H:%M:%S %Y %Z")
+                    remaining = (expire_date - datetime.utcnow()).days
+                    return remaining
+    except Exception:
+        return None
+    return None
+
+
 def execute_request(url: str):
     start = time.time()
+    parsed = urlparse(url)
+    hostname = parsed.hostname or url
+
+    ssl_days = None
+    if url.startswith("https://"):
+        ssl_days = get_ssl_expiry_days(hostname, parsed.port or 443)
+
     try:
         response = SESSION.get(
             url,
             timeout=TIMEOUT,
             headers=BROWSER_HEADERS,
             allow_redirects=True,
-            verify=False,  # Alt alan adı SSL zincir uyumsuzluklarını false-positive yapmaz
+            verify=False,
         )
         elapsed = round(time.time() - start, 2)
 
-        # 401/403: Bazı paneller parola veya kampüs içi korumalıdır, bu sitenin çöktüğü anlamına gelmez!
+        ssl_warning = ""
+        if ssl_days is not None and ssl_days <= SSL_EXPIRY_THRESHOLD_DAYS:
+            ssl_warning = f" (⚠️ SSL Bitiyor: {ssl_days} gün)"
+
         if response.status_code in [401, 403]:
             return {
                 "ok": True,
                 "url": url,
                 "status": "PROTECTED",
                 "code": response.status_code,
-                "detail": "Korumalı / Giriş Yetkisi Gerekiyor",
+                "detail": f"Korumalı / Giriş Yetkisi Gerekiyor{ssl_warning}",
                 "time": elapsed,
+                "ssl_days": ssl_days,
             }
 
         if response.status_code >= 400:
@@ -125,11 +167,11 @@ def execute_request(url: str):
                 "url": url,
                 "status": "HTTP_ERROR",
                 "code": response.status_code,
-                "detail": response.reason,
+                "detail": response.reason or "HTTP Hatası",
                 "time": elapsed,
+                "ssl_days": ssl_days,
             }
 
-        # Beyaz sayfa / kritik SQL hatası kontrolü
         body_sample = response.text[:25000].lower()
         for kw in STRICT_DANGER_KEYWORDS:
             if kw in body_sample:
@@ -140,19 +182,21 @@ def execute_request(url: str):
                     "code": response.status_code,
                     "detail": f"Kritik Hata Metni ({kw})",
                     "time": elapsed,
+                    "ssl_days": ssl_days,
                 }
 
+        detail_text = f"Sorunsuz Yanıt{ssl_warning}" if ssl_warning else "Sorunsuz Yanıt"
         return {
             "ok": True,
             "url": url,
             "status": "OK",
             "code": response.status_code,
-            "detail": "Sorunsuz Yanıt",
+            "detail": detail_text,
             "time": elapsed,
+            "ssl_days": ssl_days,
         }
 
     except requests.exceptions.SSLError:
-        # HTTPS başarısız olduysa HTTP ile bir kez daha dene
         if url.startswith("https://"):
             http_url = url.replace("https://", "http://", 1)
             try:
@@ -169,11 +213,13 @@ def execute_request(url: str):
                         "url": url,
                         "status": "OK_HTTP_FALLBACK",
                         "code": r_http.status_code,
-                        "detail": "HTTP Üzerinden Aktif (SSL Yok)",
+                        "detail": "HTTP Üzerinden Aktif (Geçersiz SSL)",
                         "time": round(time.time() - start, 2),
+                        "ssl_days": 0,
                     }
             except Exception:
                 pass
+
         return {
             "ok": False,
             "url": url,
@@ -181,7 +227,9 @@ def execute_request(url: str):
             "code": "-",
             "detail": "Geçersiz / Eksik SSL Sertifikası",
             "time": "-",
+            "ssl_days": None,
         }
+
     except requests.exceptions.Timeout:
         return {
             "ok": False,
@@ -190,16 +238,23 @@ def execute_request(url: str):
             "code": "-",
             "detail": f">{TIMEOUT}s Zaman Aşımı",
             "time": "-",
+            "ssl_days": ssl_days,
         }
-    except requests.exceptions.ConnectionError:
+
+    except requests.exceptions.ConnectionError as ce:
+        detail = "DNS Kaydı Yok veya Sunucu Kapalı"
+        if "NameResolutionError" in str(ce) or "getaddrinfo failed" in str(ce):
+            detail = "DNS Çözümlenemedi"
         return {
             "ok": False,
             "url": url,
             "status": "CONNECTION_ERROR",
             "code": "-",
-            "detail": "DNS Kaydı Yok veya Sunucu Kapalı",
+            "detail": detail,
             "time": "-",
+            "ssl_days": ssl_days,
         }
+
     except Exception as e:
         return {
             "ok": False,
@@ -208,12 +263,12 @@ def execute_request(url: str):
             "code": "-",
             "detail": str(e)[:35],
             "time": "-",
+            "ssl_days": ssl_days,
         }
 
 
 def check_single_site(url: str):
     res = execute_request(url)
-    # İlk istek başarısız olursa 2 saniye bekleyip doğrula (Ağ dalgalanmalarını bertaraf et)
     if not res["ok"]:
         time.sleep(2)
         retry_res = execute_request(url)
@@ -235,7 +290,7 @@ def send_mail(subject: str, html_body: str):
     msg.attach(MIMEText(html_body, "html"))
 
     try:
-        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=15)
         server.starttls()
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_USER, RECEIVERS, msg.as_string())
@@ -243,6 +298,34 @@ def send_mail(subject: str, html_body: str):
         print(f"E-posta başarıyla ulaştırıldı: {', '.join(RECEIVERS)}")
     except Exception as e:
         print(f"E-posta aktarım hatası: {e}")
+
+
+def send_webhook_alert(subject: str, message: str):
+    """Discord/Slack webhook ve Telegram bot uyarı gönderimi."""
+    if WEBHOOK_URL:
+        try:
+            requests.post(
+                WEBHOOK_URL,
+                json={"content": f"**{subject}**\n{message}"},
+                timeout=5,
+            )
+        except Exception as e:
+            print(f"Webhook bildirim hatası: {e}")
+
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            requests.post(
+                tg_url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": f"{subject}\n\n{message}",
+                    "parse_mode": "Markdown",
+                },
+                timeout=5,
+            )
+        except Exception as e:
+            print(f"Telegram bildirim hatası: {e}")
 
 
 def render_dashboard_email(
@@ -257,42 +340,46 @@ def render_dashboard_email(
     failures = [r for r in results if not r["ok"]]
     healthy = [r for r in results if r["ok"]]
 
-    # Hatalı siteler kart listesi
+    # E-posta istemcileriyle uyumlu table-based failure kartları
     failure_cards = ""
     if failures:
         for f in failures:
-            code_view = (
-                f"HTTP {f['code']}" if f["code"] != "-" else f["status"]
-            )
+            code_view = f"HTTP {f['code']}" if f["code"] != "-" else f["status"]
             failure_cards += f"""
-            <div style="background:#fff; border-left:4px solid #ef4444; border-radius:8px; padding:14px 16px; margin-bottom:10px; box-shadow:0 1px 3px rgba(0,0,0,0.05); border:1px solid #fee2e2; border-left-width:4px;">
-                <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                    <div>
-                        <a href="{f['url']}" target="_blank" style="color:#0f172a; font-weight:700; text-decoration:none; font-size:14px;">{f['url']}</a>
-                        <div style="color:#dc2626; font-size:12px; margin-top:4px; font-weight:500;">⚠️ {f.get('detail', 'Erişim Hatası')}</div>
-                    </div>
-                    <span style="background:#fef2f2; color:#991b1b; padding:4px 10px; border-radius:6px; font-size:11px; font-weight:700; border:1px solid #fecaca;">{code_view}</span>
-                </div>
-            </div>
+            <table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff; border:1px solid #fee2e2; border-left:4px solid #ef4444; border-radius:6px; margin-bottom:10px; font-family:Arial, sans-serif;">
+                <tr>
+                    <td style="padding:12px 14px;">
+                        <a href="{f['url']}" target="_blank" style="color:#0f172a; font-weight:bold; text-decoration:none; font-size:14px;">{f['url']}</a>
+                        <div style="color:#dc2626; font-size:12px; margin-top:4px;">⚠️ {f.get('detail', 'Erişim Hatası')}</div>
+                    </td>
+                    <td align="right" valign="top" style="padding:12px 14px;">
+                        <span style="background:#fef2f2; color:#991b1b; padding:4px 8px; border-radius:4px; font-size:11px; font-weight:bold; border:1px solid #fecaca; white-space:nowrap;">{code_view}</span>
+                    </td>
+                </tr>
+            </table>
             """
     else:
         failure_cards = """
-        <div style="background:#f0fdf4; border:1px solid #bbf7d0; border-radius:8px; padding:20px; text-align:center; color:#15803d; font-weight:600;">
-            ✅ Harika! Taranan tüm dijital varlıklar aktif ve eksiksiz yanıt veriyor.
-        </div>
+        <table width="100%" cellpadding="0" cellspacing="0" style="background:#f0fdf4; border:1px solid #bbf7d0; border-radius:6px; margin-bottom:10px; font-family:Arial, sans-serif;">
+            <tr>
+                <td style="padding:16px; text-align:center; color:#15803d; font-weight:bold; font-size:14px;">
+                    ✅ Harika! Taranan tüm dijital varlıklar aktif ve eksiksiz yanıt veriyor.
+                </td>
+            </tr>
+        </table>
         """
 
-    # Hızlı erişim için çalışan sitelerin mini listesi (ilk 10 veya özet)
     healthy_rows = ""
-    for h in healthy[:8]:
+    for h in healthy[:10]:
         lat_badge = (
             "#10b981"
             if h["time"] != "-" and h["time"] < 1.0
             else ("#f59e0b" if h["time"] != "-" and h["time"] < 2.5 else "#64748b")
         )
+        ssl_text = f" <span style='color:#f59e0b;'>({h['ssl_days']}g SSL)</span>" if h.get("ssl_days") and h["ssl_days"] <= SSL_EXPIRY_THRESHOLD_DAYS else ""
         healthy_rows += f"""
         <tr style="border-bottom:1px solid #f1f5f9; font-size:12px;">
-            <td style="padding:8px 0;"><a href="{h['url']}" style="color:#334155; text-decoration:none;">{h['url']}</a></td>
+            <td style="padding:8px 0;"><a href="{h['url']}" style="color:#334155; text-decoration:none;">{h['url']}</a>{ssl_text}</td>
             <td style="padding:8px 0; text-align:right;"><span style="color:{lat_badge}; font-weight:bold;">{h['time']}s</span></td>
         </tr>
         """
@@ -301,69 +388,63 @@ def render_dashboard_email(
     <!DOCTYPE html>
     <html lang="tr">
     <head><meta charset="UTF-8"></head>
-    <body style="margin:0; padding:24px 12px; background-color:#f1f5f9; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
-        <div style="max-width:680px; margin:0 auto; background:#ffffff; border-radius:16px; overflow:hidden; box-shadow:0 4px 12px rgba(0,0,0,0.04); border:1px solid #e2e8f0;">
-            
-            <!-- Header -->
-            <div style="background:linear-gradient(135deg, #0f172a 0%, #1e293b 100%); padding:28px 32px; color:#ffffff;">
-                <div style="display:inline-block; background:{badge_color}; color:#ffffff; font-size:11px; font-weight:800; padding:4px 12px; border-radius:20px; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:12px;">
-                    {badge_title}
-                </div>
-                <h1 style="margin:0; font-size:22px; font-weight:800; letter-spacing:-0.5px;">Kapadokya Dijital Altyapı Denetimi</h1>
-                <p style="margin:6px 0 0 0; color:#94a3b8; font-size:13px;">Son Rapor: {now_tr}</p>
-            </div>
-
-            <!-- KPI Metrikleri -->
-            <div style="padding:24px 32px; background:#f8fafc; border-bottom:1px solid #e2e8f0;">
-                <table style="width:100%; border-collapse:collapse;">
-                    <tr>
-                        <td style="width:25%; text-align:center; padding:12px; background:#ffffff; border-radius:10px; border:1px solid #e2e8f0;">
-                            <div style="font-size:11px; color:#64748b; font-weight:700; text-transform:uppercase;">Erişilebilirlik</div>
-                            <div style="font-size:22px; font-weight:800; color:{'#10b981' if uptime_rate >= 90 else '#ef4444'}; margin-top:4px;">%{uptime_rate}</div>
-                        </td>
-                        <td style="width:4%;"></td>
-                        <td style="width:23%; text-align:center; padding:12px; background:#ffffff; border-radius:10px; border:1px solid #e2e8f0;">
-                            <div style="font-size:11px; color:#64748b; font-weight:700; text-transform:uppercase;">Aktif</div>
-                            <div style="font-size:22px; font-weight:800; color:#10b981; margin-top:4px;">{len(healthy)}</div>
-                        </td>
-                        <td style="width:4%;"></td>
-                        <td style="width:23%; text-align:center; padding:12px; background:#ffffff; border-radius:10px; border:1px solid #e2e8f0;">
-                            <div style="font-size:11px; color:#64748b; font-weight:700; text-transform:uppercase;">Kesinti</div>
-                            <div style="font-size:22px; font-weight:800; color:{'#ef4444' if failures else '#64748b'}; margin-top:4px;">{len(failures)}</div>
-                        </td>
-                        <td style="width:4%;"></td>
-                        <td style="width:25%; text-align:center; padding:12px; background:#ffffff; border-radius:10px; border:1px solid #e2e8f0;">
-                            <div style="font-size:11px; color:#64748b; font-weight:700; text-transform:uppercase;">Ort. Yanıt</div>
-                            <div style="font-size:22px; font-weight:800; color:#0f172a; margin-top:4px;">{avg_latency}s</div>
-                        </td>
-                    </tr>
-                </table>
-            </div>
-
-            <!-- Ana İçerik -->
-            <div style="padding:28px 32px;">
-                <h3 style="margin:0 0 14px 0; font-size:15px; color:#0f172a; font-weight:700;">
-                    🚨 İnceleme Gerektiren Siteler ({len(failures)})
-                </h3>
-                {failure_cards}
-
-                <div style="margin-top:32px; padding-top:20px; border-top:1px solid #e2e8f0;">
-                    <div style="display:flex; justify-content:space-between; margin-bottom:10px;">
-                        <span style="font-size:13px; font-weight:700; color:#475569;">Sorunsuz Çalışan Siteler (Örnek Kesit)</span>
-                        <span style="font-size:12px; color:#10b981; font-weight:bold;">{len(healthy)}/{total_sites} Adres Aktif</span>
+    <body style="margin:0; padding:20px 10px; background-color:#f1f5f9; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+        <table width="100%" cellpadding="0" cellspacing="0" align="center" style="max-width:650px; margin:0 auto; background:#ffffff; border-radius:12px; overflow:hidden; border:1px solid #e2e8f0;">
+            <tr>
+                <td style="background:#0f172a; padding:24px 28px; color:#ffffff;">
+                    <div style="display:inline-block; background:{badge_color}; color:#ffffff; font-size:10px; font-weight:bold; padding:4px 10px; border-radius:16px; text-transform:uppercase; margin-bottom:10px;">
+                        {badge_title}
                     </div>
-                    <table style="width:100%; border-collapse:collapse;">
+                    <h1 style="margin:0; font-size:20px; font-weight:bold;">Kapadokya Dijital Altyapı Denetimi</h1>
+                    <p style="margin:4px 0 0 0; color:#94a3b8; font-size:12px;">Rapor Saati: {now_tr}</p>
+                </td>
+            </tr>
+            <tr>
+                <td style="padding:20px 24px; background:#f8fafc; border-bottom:1px solid #e2e8f0;">
+                    <table width="100%" cellpadding="0" cellspacing="6">
+                        <tr>
+                            <td width="25%" align="center" style="background:#ffffff; padding:10px; border-radius:8px; border:1px solid #e2e8f0;">
+                                <div style="font-size:10px; color:#64748b; font-weight:bold; text-transform:uppercase;">Erişilebilirlik</div>
+                                <div style="font-size:18px; font-weight:bold; color:{'#10b981' if uptime_rate >= 90 else '#ef4444'}; margin-top:2px;">%{uptime_rate}</div>
+                            </td>
+                            <td width="25%" align="center" style="background:#ffffff; padding:10px; border-radius:8px; border:1px solid #e2e8f0;">
+                                <div style="font-size:10px; color:#64748b; font-weight:bold; text-transform:uppercase;">Aktif</div>
+                                <div style="font-size:18px; font-weight:bold; color:#10b981; margin-top:2px;">{len(healthy)}</div>
+                            </td>
+                            <td width="25%" align="center" style="background:#ffffff; padding:10px; border-radius:8px; border:1px solid #e2e8f0;">
+                                <div style="font-size:10px; color:#64748b; font-weight:bold; text-transform:uppercase;">Kesinti</div>
+                                <div style="font-size:18px; font-weight:bold; color:{'#ef4444' if failures else '#64748b'}; margin-top:2px;">{len(failures)}</div>
+                            </td>
+                            <td width="25%" align="center" style="background:#ffffff; padding:10px; border-radius:8px; border:1px solid #e2e8f0;">
+                                <div style="font-size:10px; color:#64748b; font-weight:bold; text-transform:uppercase;">Ort. Yanıt</div>
+                                <div style="font-size:18px; font-weight:bold; color:#0f172a; margin-top:2px;">{avg_latency}s</div>
+                            </td>
+                        </tr>
+                    </table>
+                </td>
+            </tr>
+            <tr>
+                <td style="padding:24px 28px;">
+                    <div style="font-size:14px; font-weight:bold; color:#0f172a; margin-bottom:12px;">🚨 Kesinti & İnceleme Gerektiren Siteler ({len(failures)})</div>
+                    {failure_cards}
+
+                    <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:24px; border-top:1px solid #e2e8f0; padding-top:14px;">
+                        <tr>
+                            <td style="font-size:13px; font-weight:bold; color:#475569; padding-bottom:8px;">Sorunsuz Çalışan Siteler (Örnek Liste)</td>
+                            <td align="right" style="font-size:12px; color:#10b981; font-weight:bold; padding-bottom:8px;">{len(healthy)}/{total_sites} Aktif</td>
+                        </tr>
+                    </table>
+                    <table width="100%" cellpadding="0" cellspacing="0">
                         {healthy_rows}
                     </table>
-                </div>
-            </div>
-
-            <!-- Footer -->
-            <div style="background:#f8fafc; padding:16px 32px; text-align:center; font-size:12px; color:#94a3b8; border-top:1px solid #e2e8f0;">
-                Bu rapor Kapadokya Üniversitesi Uptime Botu tarafından GitHub Actions üzerinde otomatik olarak derlenmiştir.
-            </div>
-
-        </div>
+                </td>
+            </tr>
+            <tr>
+                <td style="background:#f8fafc; padding:14px 24px; text-align:center; font-size:11px; color:#94a3b8; border-top:1px solid #e2e8f0;">
+                    Kapadokya Üniversitesi Dijital Altyapı Denetim Botu
+                </td>
+            </tr>
+        </table>
     </body>
     </html>
     """
@@ -418,7 +499,7 @@ def main():
         ((len(sites) - len(current_failures)) / len(sites)) * 100, 1
     )
 
-    # 1. 24 Saatlik Genel Sağlık Özeti (Manuel tetikleme veya Sabah 09:17)
+    # 1. Günlük Sağlık Bülteni
     if is_daily_report:
         print("24 saatlik genel sağlık bülteni gönderiliyor...")
         badge_color = "#10b981" if uptime_rate >= 95 else "#ef4444"
@@ -434,7 +515,7 @@ def main():
         send_mail(subject, html)
         return
 
-    # 2. Anlık Çökme Uyarısı (Sadece yeni bir site çökerse)
+    # 2. Anlık Kesinti / Kurtarma Alarmları
     if new_failures:
         print(f"Yeni kesinti: {len(new_failures)} site.")
         subject = f"🚨 [ALARM] {len(new_failures)} Adres Yanıt Vermiyor!"
@@ -447,6 +528,11 @@ def main():
             avg_latency,
         )
         send_mail(subject, html)
+
+        # Telegram / Discord bildirim metni
+        err_msg = "\n".join([f"- {f['url']} ({f['detail']})" for f in new_failures])
+        send_webhook_alert(subject, f"Aşağıdaki adreslerde kesinti tespit edildi:\n{err_msg}")
+
     elif recovered_sites:
         print(f"Düzelen siteler: {len(recovered_sites)} site.")
         subject = f"🟢 [DÜZELDİ] {len(recovered_sites)} Site Tekrar Erişilebilir"
@@ -459,8 +545,12 @@ def main():
             avg_latency,
         )
         send_mail(subject, html)
+
+        rec_msg = "\n".join([f"- {r['url']}" for r in recovered_sites])
+        send_webhook_alert(subject, f"Aşağıdaki adresler yeniden normale döndü:\n{rec_msg}")
+
     else:
-        print(f"Değişiklik yok. Toplam {len(sites)} adres sağlıklı.")
+        print(f"Değişiklik yok. Toplam {len(sites)} adres incelendi.")
 
 
 if __name__ == "__main__":
