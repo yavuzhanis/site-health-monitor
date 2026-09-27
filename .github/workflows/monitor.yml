@@ -22,6 +22,9 @@ jobs:
     steps:
       - name: Repoyu Klonla
         uses: actions/checkout@v4
+        with:
+          # Git commit & push sırasında geçmiş ve HEAD senkronizasyonu için
+          fetch-depth: 0
 
       - name: Python Ortamını Kur
         uses: actions/setup-python@v5
@@ -30,14 +33,21 @@ jobs:
           cache: 'pip'
 
       - name: Paketleri Yükle
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Siteleri Denetle ve Mail Gönder
+      - name: Siteleri Denetle ve Raporla
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECEIVER_EMAILS: ${{ secrets.RECEIVER_EMAILS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TIMEOUT_SECONDS: '8'
+          MAX_WORKERS: '10'
+          SSL_EXPIRY_THRESHOLD_DAYS: '14'
           # Sabah 06:17 UTC çalışmasında veya manuel tetiklemede DAILY_REPORT=true olur
           DAILY_REPORT: ${{ github.event.schedule == '17 6 * * *' || inputs.force_daily_report == true }}
         run: python monitor.py
@@ -46,6 +56,14 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add state.json || true
-          git commit -m "chore: update monitor state [skip ci]" || echo "Değişiklik yok"
-          git push origin main || true
+          
+          if [ -f state.json ]; then
+            git add state.json
+            if ! git diff --staged --quiet; then
+              git commit -m "chore: update monitor state [skip ci]"
+              git pull --rebase origin main
+              git push origin main
+            else
+              echo "Durum dosyasında değişiklik tespit edilmedi."
+            fi
+          fi
