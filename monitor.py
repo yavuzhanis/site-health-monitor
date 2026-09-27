@@ -49,6 +49,9 @@ STRICT_DANGER_KEYWORDS = [
     "sqlstate[hy000]",
     "database connection error",
     "error establishing a database connection",
+    "sayfa bulunamadı",
+    "404 not found",
+    "sunucu bulunamıyor",
 ]
 
 
@@ -107,7 +110,6 @@ SESSION = create_session()
 
 
 def get_ssl_expiry_days(hostname: str, port: int = 443):
-    """Sertifikanın bitmesine kalan gün sayısını döner."""
     try:
         context = ssl.create_default_context()
         context.check_hostname = False
@@ -122,8 +124,7 @@ def get_ssl_expiry_days(hostname: str, port: int = 443):
                     expire_date = datetime.strptime(
                         expire_date_str, "%b %d %H:%M:%S %Y %Z"
                     )
-                    remaining = (expire_date - datetime.utcnow()).days
-                    return remaining
+                    return (expire_date - datetime.utcnow()).days
     except Exception:
         return None
     return None
@@ -132,9 +133,9 @@ def get_ssl_expiry_days(hostname: str, port: int = 443):
 def execute_request(url: str):
     start = time.time()
     parsed = urlparse(url)
-    hostname = parsed.hostname
+    target_host = parsed.hostname
 
-    if not hostname:
+    if not target_host:
         return {
             "ok": False,
             "url": url,
@@ -142,21 +143,19 @@ def execute_request(url: str):
             "code": "-",
             "detail": "Geçersiz URL Formatı",
             "time": "-",
-            "ssl_days": None,
         }
 
-    # 1. Ön DNS Çözümleme Denetimi
+    # 1. DNS Çözümleme Testi
     try:
-        socket.gethostbyname(hostname)
+        socket.gethostbyname(target_host)
     except socket.gaierror:
         return {
             "ok": False,
             "url": url,
             "status": "DNS_NOT_FOUND",
             "code": "-",
-            "detail": "Sunucu Bulunamıyor (DNS Kaydı Yok)",
+            "detail": "Sunucu Bulunamıyor (DNS Yok)",
             "time": "-",
-            "ssl_days": None,
         }
     except Exception as e:
         return {
@@ -164,17 +163,16 @@ def execute_request(url: str):
             "url": url,
             "status": "SOCKET_ERROR",
             "code": "-",
-            "detail": f"Ağ Hatası: {str(e)[:25]}",
+            "detail": f"Bağlantı Hatası: {str(e)[:25]}",
             "time": "-",
-            "ssl_days": None,
         }
 
-    # 2. SSL Kalan Gün Kontrolü
+    # 2. SSL Süre Kontrolü
     ssl_days = None
     if url.startswith("https://"):
-        ssl_days = get_ssl_expiry_days(hostname, parsed.port or 443)
+        ssl_days = get_ssl_expiry_days(target_host, parsed.port or 443)
 
-    # 3. HTTP İstek Denetimi
+    # 3. HTTP İsteği ve Sahte 200 Denetimi
     try:
         response = SESSION.get(
             url,
@@ -185,25 +183,21 @@ def execute_request(url: str):
         )
         elapsed = round(time.time() - start, 2)
 
-        # Yanlış wildcard veya hata yönlendirmesi denetimi
-        final_hostname = urlparse(response.url).hostname
-        if (
-            final_hostname
-            and final_hostname != hostname
-            and not hostname.endswith(final_hostname)
-        ):
-            if any(
-                term in response.url.lower()
-                for term in ["error", "search", "park", "bulunamadi"]
-            ):
+        # Wildcard / Sessiz Yönlendirme Analizi:
+        # Eğer alt domain çöktüğü için sistem bizi ana domain portala yönlendirdiyse bunu çökme say!
+        final_host = urlparse(response.url).hostname
+        if final_host and final_host.lower() != target_host.lower():
+            # Eğer www ekleme/çıkarma dışında farklı bir yere yönlendirildiyse
+            clean_target = target_host.replace("www.", "")
+            clean_final = final_host.replace("www.", "")
+            if clean_target != clean_final:
                 return {
                     "ok": False,
                     "url": url,
-                    "status": "REDIRECT_LOOP",
+                    "status": "REDIRECT_MISMATCH",
                     "code": response.status_code,
-                    "detail": "Hata / Park Sayfasına Yönlendirildi",
+                    "detail": f"Adres Yönlendirildi -> {final_host}",
                     "time": elapsed,
-                    "ssl_days": ssl_days,
                 }
 
         ssl_warning = ""
@@ -216,9 +210,8 @@ def execute_request(url: str):
                 "url": url,
                 "status": "PROTECTED",
                 "code": response.status_code,
-                "detail": f"Korumalı / Giriş Yetkisi Gerekiyor{ssl_warning}",
+                "detail": f"Korumalı Alan{ssl_warning}",
                 "time": elapsed,
-                "ssl_days": ssl_days,
             }
 
         if response.status_code >= 400:
@@ -227,11 +220,11 @@ def execute_request(url: str):
                 "url": url,
                 "status": "HTTP_ERROR",
                 "code": response.status_code,
-                "detail": response.reason or "HTTP Hatası",
+                "detail": response.reason or f"HTTP {response.status_code}",
                 "time": elapsed,
-                "ssl_days": ssl_days,
             }
 
+        # Gövde Hata Metni / Soft 404 Denetimi
         body_sample = response.text[:25000].lower()
         for kw in STRICT_DANGER_KEYWORDS:
             if kw in body_sample:
@@ -240,48 +233,20 @@ def execute_request(url: str):
                     "url": url,
                     "status": "BODY_ERROR",
                     "code": response.status_code,
-                    "detail": f"Kritik Hata Metni ({kw})",
+                    "detail": f"Kritik Hata / 404 ({kw})",
                     "time": elapsed,
-                    "ssl_days": ssl_days,
                 }
 
-        detail_text = (
-            f"Sorunsuz Yanıt{ssl_warning}" if ssl_warning else "Sorunsuz Yanıt"
-        )
         return {
             "ok": True,
             "url": url,
             "status": "OK",
             "code": response.status_code,
-            "detail": detail_text,
+            "detail": f"Sorunsuz Yanıt{ssl_warning}",
             "time": elapsed,
-            "ssl_days": ssl_days,
         }
 
     except requests.exceptions.SSLError:
-        if url.startswith("https://"):
-            http_url = url.replace("https://", "http://", 1)
-            try:
-                r_http = SESSION.get(
-                    http_url,
-                    timeout=TIMEOUT,
-                    headers=BROWSER_HEADERS,
-                    allow_redirects=True,
-                    verify=False,
-                )
-                if r_http.status_code < 400 or r_http.status_code in [401, 403]:
-                    return {
-                        "ok": True,
-                        "url": url,
-                        "status": "OK_HTTP_FALLBACK",
-                        "code": r_http.status_code,
-                        "detail": "HTTP Üzerinden Aktif (Geçersiz SSL)",
-                        "time": round(time.time() - start, 2),
-                        "ssl_days": 0,
-                    }
-            except Exception:
-                pass
-
         return {
             "ok": False,
             "url": url,
@@ -289,7 +254,6 @@ def execute_request(url: str):
             "code": "-",
             "detail": "Geçersiz / Eksik SSL Sertifikası",
             "time": "-",
-            "ssl_days": None,
         }
 
     except requests.exceptions.Timeout:
@@ -300,11 +264,10 @@ def execute_request(url: str):
             "code": "-",
             "detail": f">{TIMEOUT}s Zaman Aşımı",
             "time": "-",
-            "ssl_days": ssl_days,
         }
 
     except requests.exceptions.ConnectionError as ce:
-        detail = "DNS Kaydı Yok veya Sunucu Kapalı"
+        detail = "Sunucuya Bağlanılamadı"
         if "NameResolutionError" in str(ce) or "getaddrinfo failed" in str(ce):
             detail = "DNS Çözümlenemedi"
         return {
@@ -314,7 +277,6 @@ def execute_request(url: str):
             "code": "-",
             "detail": detail,
             "time": "-",
-            "ssl_days": ssl_days,
         }
 
     except Exception as e:
@@ -325,13 +287,11 @@ def execute_request(url: str):
             "code": "-",
             "detail": str(e)[:35],
             "time": "-",
-            "ssl_days": ssl_days,
         }
 
 
 def check_single_site(url: str):
     res = execute_request(url)
-    # Hata durumunda teyit için 2 sn bekleyip tekrar dene
     if not res["ok"]:
         time.sleep(2)
         retry_res = execute_request(url)
@@ -364,7 +324,6 @@ def send_mail(subject: str, html_body: str):
 
 
 def send_webhook_alert(subject: str, message: str):
-    """Discord/Slack webhook ve Telegram bot uyarı gönderimi."""
     if WEBHOOK_URL:
         try:
             requests.post(
@@ -372,8 +331,8 @@ def send_webhook_alert(subject: str, message: str):
                 json={"content": f"**{subject}**\n{message}"},
                 timeout=5,
             )
-        except Exception as e:
-            print(f"Webhook bildirim hatası: {e}")
+        except Exception:
+            pass
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
@@ -383,12 +342,11 @@ def send_webhook_alert(subject: str, message: str):
                 json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": f"{subject}\n\n{message}",
-                    "parse_mode": "Markdown",
                 },
                 timeout=5,
             )
-        except Exception as e:
-            print(f"Telegram bildirim hatası: {e}")
+        except Exception:
+            pass
 
 
 def render_dashboard_email(
@@ -399,11 +357,9 @@ def render_dashboard_email(
     uptime_rate: float,
     avg_latency: float,
 ):
-    total_sites = len(results)
     failures = [r for r in results if not r["ok"]]
-    healthy = [r for r in results if r["ok"]]
+    healthy_count = len(results) - len(failures)
 
-    # E-posta istemcileriyle uyumlu iç içe table mimarisi
     failure_cards = ""
     if failures:
         for f in failures:
@@ -411,11 +367,11 @@ def render_dashboard_email(
             failure_cards += f"""
             <table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff; border:1px solid #fee2e2; border-left:4px solid #ef4444; border-radius:6px; margin-bottom:10px; font-family:Arial, sans-serif;">
                 <tr>
-                    <td style="padding:12px 14px;">
+                    <td style="padding:14px;">
                         <a href="{f['url']}" target="_blank" style="color:#0f172a; font-weight:bold; text-decoration:none; font-size:14px;">{f['url']}</a>
-                        <div style="color:#dc2626; font-size:12px; margin-top:4px;">⚠️ {f.get('detail', 'Erişim Hatası')}</div>
+                        <div style="color:#dc2626; font-size:12px; margin-top:4px; font-weight:500;">⚠️ {f.get('detail', 'Erişim Hatası')}</div>
                     </td>
-                    <td align="right" valign="top" style="padding:12px 14px;">
+                    <td align="right" valign="top" style="padding:14px;">
                         <span style="background:#fef2f2; color:#991b1b; padding:4px 8px; border-radius:4px; font-size:11px; font-weight:bold; border:1px solid #fecaca; white-space:nowrap;">{code_view}</span>
                     </td>
                 </tr>
@@ -425,32 +381,14 @@ def render_dashboard_email(
         failure_cards = """
         <table width="100%" cellpadding="0" cellspacing="0" style="background:#f0fdf4; border:1px solid #bbf7d0; border-radius:6px; margin-bottom:10px; font-family:Arial, sans-serif;">
             <tr>
-                <td style="padding:16px; text-align:center; color:#15803d; font-weight:bold; font-size:14px;">
+                <td style="padding:18px; text-align:center; color:#15803d; font-weight:bold; font-size:14px;">
                     ✅ Harika! Taranan tüm dijital varlıklar aktif ve eksiksiz yanıt veriyor.
                 </td>
             </tr>
         </table>
         """
 
-    healthy_rows = ""
-    for h in healthy[:10]:
-        lat_badge = (
-            "#10b981"
-            if h["time"] != "-" and h["time"] < 1.0
-            else ("#f59e0b" if h["time"] != "-" and h["time"] < 2.5 else "#64748b")
-        )
-        ssl_text = (
-            f" <span style='color:#f59e0b;'>({h['ssl_days']}g SSL)</span>"
-            if h.get("ssl_days") and h["ssl_days"] <= SSL_EXPIRY_THRESHOLD_DAYS
-            else ""
-        )
-        healthy_rows += f"""
-        <tr style="border-bottom:1px solid #f1f5f9; font-size:12px;">
-            <td style="padding:8px 0;"><a href="{h['url']}" style="color:#334155; text-decoration:none;">{h['url']}</a>{ssl_text}</td>
-            <td style="padding:8px 0; text-align:right;"><span style="color:{lat_badge}; font-weight:bold;">{h['time']}s</span></td>
-        </tr>
-        """
-
+    # "Sorunsuz çalışan siteler" bölümü tamamen temizlendi
     return f"""
     <!DOCTYPE html>
     <html lang="tr">
@@ -476,7 +414,7 @@ def render_dashboard_email(
                             </td>
                             <td width="25%" align="center" style="background:#ffffff; padding:10px; border-radius:8px; border:1px solid #e2e8f0;">
                                 <div style="font-size:10px; color:#64748b; font-weight:bold; text-transform:uppercase;">Aktif</div>
-                                <div style="font-size:18px; font-weight:bold; color:#10b981; margin-top:2px;">{len(healthy)}</div>
+                                <div style="font-size:18px; font-weight:bold; color:#10b981; margin-top:2px;">{healthy_count}</div>
                             </td>
                             <td width="25%" align="center" style="background:#ffffff; padding:10px; border-radius:8px; border:1px solid #e2e8f0;">
                                 <div style="font-size:10px; color:#64748b; font-weight:bold; text-transform:uppercase;">Kesinti</div>
@@ -494,16 +432,6 @@ def render_dashboard_email(
                 <td style="padding:24px 28px;">
                     <div style="font-size:14px; font-weight:bold; color:#0f172a; margin-bottom:12px;">🚨 Kesinti & İnceleme Gerektiren Siteler ({len(failures)})</div>
                     {failure_cards}
-
-                    <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:24px; border-top:1px solid #e2e8f0; padding-top:14px;">
-                        <tr>
-                            <td style="font-size:13px; font-weight:bold; color:#475569; padding-bottom:8px;">Sorunsuz Çalışan Siteler (Örnek Liste)</td>
-                            <td align="right" style="font-size:12px; color:#10b981; font-weight:bold; padding-bottom:8px;">{len(healthy)}/{total_sites} Aktif</td>
-                        </tr>
-                    </table>
-                    <table width="100%" cellpadding="0" cellspacing="0">
-                        {healthy_rows}
-                    </table>
                 </td>
             </tr>
             <tr>
