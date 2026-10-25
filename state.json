@@ -21,7 +21,7 @@
   "https://commonhorizon.kapadokya.edu.tr": true,
   "https://ecocene.kapadokya.edu.tr": true,
   "https://eduroam.kapadokya.edu.tr": true,
-  "https://ehconference.kapadokya.edu.tr": false,
+  "https://ehconference.kapadokya.edu.tr": true,
   "https://eko.kapadokya.edu.tr": true,
   "https://elevate.kapadokya.edu.tr": true,
   "https://engelsizkampus.kapadokya.edu.tr": true,
