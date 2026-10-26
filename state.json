@@ -98,7 +98,7 @@
   "https://stp.kapadokya.edu.tr": true,
   "https://tahsilat.kapadokya.edu.tr": true,
   "https://test.kapadokya.edu.tr": true,
-  "https://test2.kapadokya.edu.tr": false,
+  "https://test2.kapadokya.edu.tr": true,
   "https://turistrehberi.kapadokya.edu.tr": false,
   "https://turizm.kapadokya.edu.tr": true,
   "https://uzaktanogretim.kapadokya.edu.tr/almsp/": false,
