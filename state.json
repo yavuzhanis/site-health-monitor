@@ -54,7 +54,7 @@
   "https://ksbd.kapadokya.edu.tr": true,
   "https://kunplus.kapadokya.edu.tr": true,
   "https://kunss.kapadokya.edu.tr": true,
-  "https://kutuphane.kapadokya.edu.tr": false,
+  "https://kutuphane.kapadokya.edu.tr": true,
   "https://lifos.kapadokya.edu.tr": false,
   "https://lisansustu.kapadokya.edu.tr": true,
   "https://lisansustudemo.kapadokya.edu.tr": true,
