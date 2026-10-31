@@ -95,7 +95,7 @@
   "https://sis.kapadokya.edu.tr": true,
   "https://smtp.kapadokya.edu.tr": false,
   "https://sscm.kapadokya.edu.tr": true,
-  "https://stp.kapadokya.edu.tr": false,
+  "https://stp.kapadokya.edu.tr": true,
   "https://tahsilat.kapadokya.edu.tr": true,
   "https://test.kapadokya.edu.tr": true,
   "https://test2.kapadokya.edu.tr": true,
